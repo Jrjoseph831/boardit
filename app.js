@@ -15,6 +15,7 @@ const PALETTE = [null, '#e5484d', '#2f6bff', '#2fa56b', '#f08c00', '#8e4ec6'];
 const PEN_W = [2.5, 4.5, 8];
 const ERASE_R = [10, 20, 34];
 const ICON = {
+  text: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
   laser: '<circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',
   pen: '<path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 013 3L8 19z"/><path d="M14.5 6.5l3 3"/>',
   hl: '<path d="M14 5l5 5-8 8H6v-5z"/><path d="M4 21h9"/>',
@@ -110,6 +111,8 @@ let drag = null;        // question being dragged
 let panning = null;
 let hoverItem = null;
 let editing = null;
+let textPending = null;   // text tool: click recorded, editor opens on release
+const recentDots = [];    // tiny strokes from the clicks of a double-click, removed again when it becomes a text box
 let raf = 0;
 const requestDraw = () => { if (!raf) raf = requestAnimationFrame(draw); };
 
@@ -332,6 +335,7 @@ cv.addEventListener('pointerdown', e => {
     if (it) { startDrag(it, w); return; }
   }
   const t = tool.name;
+  if (t === 'text') { textPending = w; return; }
   if (t === 'laser') { mouse = { x: w.x, y: e.clientY - cv.getBoundingClientRect().top, in: true }; requestDraw(); return; }
   if (t === 'eraser') { erasing = { list: [] }; eraseAt(w.x, w.y); requestDraw(); return; }
   const wd = t === 'hl' ? PEN_W[tool.size] * 4.5 : PEN_W[tool.size];
@@ -364,19 +368,21 @@ cv.addEventListener('pointermove', e => {
     const hit = w.x < GRIP_W ? itemAt(w, true) : null;
     const hv = hit || (w.x < X0 + cur.wrapW + 30 ? itemAt(w) : null);
     if (hv !== hoverItem) { hoverItem = hv; }
-    cv.style.cursor = hit ? 'grab' : (tool.name === 'eraser' || tool.name === 'laser') ? 'none' : 'crosshair';
+    cv.style.cursor = hit ? 'grab' : (tool.name === 'eraser' || tool.name === 'laser') ? 'none' : tool.name === 'text' ? 'text' : 'crosshair';
   }
   requestDraw();
 });
 const endPointer = e => {
   if (panning) { panning = null; return; }
   if (drag) { endDrag(); return; }
+  if (textPending) { const w = textPending; textPending = null; setTimeout(() => textAt(w), 0); return; }
   if (live) {
     const s = live;
     live = null;
     s.bb = bboxOf(s);
     if (s.pts.length > 4 && (s.t === 'pen' || s.t === 'hl')) simplify(s);
     commit(cur, [{ k: 'add', s }]);
+    if (s.pts.length <= 4 && s.bb[2] - s.bb[0] < 14) { recentDots.push({ s, ops: cur.undo[cur.undo.length - 1], t: performance.now() }); if (recentDots.length > 4) recentDots.shift(); }
   }
   if (erasing) { const l = erasing.list; erasing = null; if (l.length) { l.forEach(s => cur.strokes.push(s)); commit(cur, [{ k: 'del', list: l }]); } }
   requestDraw();
@@ -391,10 +397,50 @@ cv.addEventListener('pointercancel', endPointer);
 cv.addEventListener('pointerleave', () => { mouse.in = false; hoverItem = null; requestDraw(); });
 cv.addEventListener('dblclick', e => {
   if (!cur) return;
-  const it = itemAt(toWorld(e));
-  if (it) openEditor(it);
+  const w = toWorld(e), it = itemAt(w);
+  if (it) { openEditor(it); return; }
+  // the two clicks of the double-click may have left dots: take them back
+  for (const d of recentDots.splice(0)) {
+    if (performance.now() - d.t > 700) continue;
+    const i = cur.strokes.indexOf(d.s); if (i >= 0) cur.strokes.splice(i, 1);
+    const u = cur.undo.indexOf(d.ops); if (u >= 0) cur.undo.splice(u, 1);
+  }
+  changed(); textAt(w);
 });
-cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (!cur) return;
+  const w = toWorld(e), it = itemAt(w);
+  it ? openEditor(it) : textAt(w);
+});
+/* Start typing: a new text box where you clicked (or edit the one under the cursor) */
+function textAt(w) {
+  if (!cur) return;
+  const hit = itemAt(w);
+  if (hit) { openEditor(hit); return; }
+  const lh = Math.round(cur.size * 1.42);
+  const it = { id: uid(), y: Math.max(16, Math.round(w.y - lh / 2)), lines: [], imgs: [] };
+  cur.items.push(it);
+  openEditor(it, true);
+}
+/* Paste text or a screenshot straight onto the board */
+addEventListener('paste', async e => {
+  if (!cur || editing || !$('#modal').hidden || /INPUT|TEXTAREA/.test(document.activeElement.tagName)) return;
+  const cd = e.clipboardData; if (!cd) return;
+  const file = [...cd.files].find(f => f.type.startsWith('image/'));
+  const text = cd.getData('text/plain');
+  if (!file && !text.trim()) return;
+  e.preventDefault();
+  const b = cur, y = mouse.in ? Math.max(16, Math.round(mouse.y + scroller.scrollTop)) : Math.round(scroller.scrollTop + 60);
+  const it = { id: uid(), y, lines: [], imgs: [] };
+  if (text.trim()) it.lines = text.split(/\r?\n/).filter(l => l.trim()).map(l => ({ t: l.trim(), ind: 0 }));
+  if (file) {
+    const src = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(file); });
+    const im = await imgSize(src); if (im) it.imgs.push(im);
+  }
+  if (!it.lines.length && !it.imgs.length) return;
+  commit(b, [{ k: 'addItem', it }]);
+});
 
 /* ---------- dragging a question (pushes everything below it) ---------- */
 function startDrag(it, w) {
@@ -806,7 +852,7 @@ function openSettings(board) {
 addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) $('#modal .done').click(); });
 
 /* ---------- toolbar ---------- */
-const TOOLS = [['laser', 'Pointer (L)'], ['pen', 'Pen (P)'], ['hl', 'Highlighter (H)'], ['eraser', 'Eraser (E)'], ['line', 'Line'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse']];
+const TOOLS = [['laser', 'Pointer (L)'], ['text', 'Type (T) — or double-click / right-click anywhere'], ['pen', 'Pen (P)'], ['hl', 'Highlighter (H)'], ['eraser', 'Eraser (E)'], ['line', 'Line'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse']];
 function buildToolbar() {
   const tb = $('#toolbar'); tb.innerHTML = '';
   const grp = () => { const g = document.createElement('div'); g.className = 'grp'; tb.append(g); return g; };
@@ -814,7 +860,7 @@ function buildToolbar() {
   let g = grp();
   btn(g, 'collapse', 'Hide toolbar (F)', () => setCollapsed(true), 'tb wide');
   g = grp();
-  TOOLS.forEach(([n, t]) => { const b = btn(g, n, t, () => { tool.name = n; updateToolbarState(); cv.style.cursor = n === 'eraser' || n === 'laser' ? 'none' : 'crosshair'; }); b.dataset.tool = n; });
+  TOOLS.forEach(([n, t]) => { const b = btn(g, n, t, () => { tool.name = n; updateToolbarState(); cv.style.cursor = n === 'eraser' || n === 'laser' ? 'none' : n === 'text' ? 'text' : 'crosshair'; }); b.dataset.tool = n; });
   g = grp();
   PALETTE.forEach((c, i) => {
     const b = document.createElement('button'); b.className = 'sw'; b.dataset.i = i; b.title = c ? 'Color' : 'Default ink'; b.setAttribute('aria-label', b.title);
@@ -856,7 +902,7 @@ addEventListener('keydown', e => {
   else if (mod) return;
   else if (k === 'f') setCollapsed(!document.body.classList.contains('collapsed'));
   else if (k === 'escape') setCollapsed(false);
-  else if ({ p: 'pen', h: 'hl', e: 'eraser', l: 'laser' }[k]) { tool.name = { p: 'pen', h: 'hl', e: 'eraser', l: 'laser' }[k]; updateToolbarState(); }
+  else if ({ p: 'pen', h: 'hl', e: 'eraser', l: 'laser', t: 'text' }[k]) { tool.name = { p: 'pen', h: 'hl', e: 'eraser', l: 'laser', t: 'text' }[k]; updateToolbarState(); }
 });
 
 /* ---------- boot ---------- */
