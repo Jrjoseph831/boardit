@@ -557,15 +557,87 @@ function parseHtml(html, mode) {
   return { items: items.filter(i => i.lines.length || i.imgs.length), qCount };
 }
 const imgSize = src => new Promise(res => { const i = new Image(); i.onload = () => res({ src, w: i.naturalWidth, h: i.naturalHeight }); i.onerror = () => res(null); i.src = src; });
+/* Legacy .doc (binary Word 97-2003): read the piece table out of the OLE container */
+function docToText(buf) {
+  const cfb = CFB.read(new Uint8Array(buf), { type: 'array' });
+  const wd = CFB.find(cfb, '/WordDocument'); if (!wd) throw new Error('not a Word file');
+  const d = new DataView(wd.content.buffer, wd.content.byteOffset, wd.content.byteLength);
+  if (d.getUint16(0, true) !== 0xA5EC) throw new Error('bad FIB');
+  const tbl = CFB.find(cfb, (d.getUint16(0x0A, true) & 0x0200) ? '/1Table' : '/0Table');
+  if (!tbl) throw new Error('no table stream');
+  const t = new DataView(tbl.content.buffer, tbl.content.byteOffset, tbl.content.byteLength);
+  const ccpText = d.getInt32(0x4C, true), fcClx = d.getUint32(0x1A2, true);
+  let p = fcClx;
+  while (t.getUint8(p) === 1) p += 3 + t.getUint16(p + 1, true);   // skip Prc entries
+  if (t.getUint8(p) !== 2) throw new Error('no piece table');
+  const lcb = t.getUint32(p + 1, true), n = (lcb - 4) / 12, cp0 = p + 5, pcd0 = cp0 + (n + 1) * 4;
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    const cs = t.getInt32(cp0 + i * 4, true), ce = Math.min(t.getInt32(cp0 + (i + 1) * 4, true), ccpText);
+    if (ce <= cs) continue;
+    let fc = t.getUint32(pcd0 + i * 8 + 2, true); const comp = !!(fc & 0x40000000); fc &= 0x3FFFFFFF;
+    const len = ce - cs, bytes = wd.content;
+    if (comp) { fc = Math.floor(fc / 2); out += new TextDecoder('windows-1252').decode(bytes.subarray(fc, fc + len)); }
+    else out += new TextDecoder('utf-16le').decode(bytes.subarray(fc, fc + len * 2));
+  }
+  out = out.replace(/\x13[^\x14\x15]*\x14/g, '').replace(/[\x13\x15]/g, '')   // keep field results, drop field codes
+    .replace(/\x07/g, '   ').replace(/\x0B/g, '\r').replace(/[\x00-\x08\x0C\x0E-\x1F]/g, '');
+  return out;
+}
+function rtfToText(src) {
+  const skip = new Set(['fonttbl', 'colortbl', 'stylesheet', 'info', 'pict', 'header', 'footer', 'footnote', 'themedata', 'colorschememapping', 'datastore', 'latentstyles', 'listtable', 'listoverridetable', 'rsidtbl', 'generator']);
+  let out = '', depth = 0, skipDepth = 0, uc = 1, i = 0;
+  const stack = [];
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '{') { stack.push(uc); depth++; i++; }
+    else if (c === '}') { if (skipDepth && depth === skipDepth) skipDepth = 0; depth--; uc = stack.pop() ?? 1; i++; }
+    else if (c === '\\') {
+      const m = /^\\([a-zA-Z]+)(-?\d+)? ?/.exec(src.slice(i, i + 40));
+      if (m) {
+        i += m[0].length; const w = m[1], n = m[2] === undefined ? null : +m[2];
+        if (skipDepth) continue;
+        if (w === 'par' || w === 'line' || w === 'sect') out += '\r';
+        else if (w === 'tab') out += '\t';
+        else if (w === 'u' && n !== null) { out += String.fromCharCode(n < 0 ? n + 65536 : n); i += uc; }
+        else if (w === 'uc' && n !== null) uc = n;
+        else if (w === 'bullet') out += '•';
+        else if (w === 'endash') out += '–'; else if (w === 'emdash') out += '—';
+        else if (w === 'lquote' || w === 'rquote') out += '’'; else if (w === 'ldblquote' || w === 'rdblquote') out += '”';
+        else if (skip.has(w)) skipDepth = depth;
+      } else {
+        const nx = src[i + 1];
+        if (nx === "'") { if (!skipDepth) out += String.fromCharCode(parseInt(src.substr(i + 2, 2), 16)); i += 4; }
+        else if (nx === '*') { if (!skipDepth) skipDepth = depth; i += 2; }
+        else { if (!skipDepth && (nx === '\\' || nx === '{' || nx === '}')) out += nx; i += 2; }
+      }
+    } else { if (!skipDepth && c !== '\n' && c !== '\r') out += c; i++; }
+  }
+  return out;
+}
+const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const textToHtml = t => t.split(/\r|\n/).map(l => l.trim()).filter(Boolean).map(l => `<p>${esc(l)}</p>`).join('');
+/* Any Word-ish file in, HTML out. Detects the real format from the bytes, not the extension. */
+async function wordToHtml(file) {
+  const buf = await file.arrayBuffer(), h = new Uint8Array(buf, 0, 8);
+  if (h[0] === 0x50 && h[1] === 0x4B) return (await mammoth.convertToHtml({ arrayBuffer: buf })).value;
+  if (h[0] === 0xD0 && h[1] === 0xCF) {
+    if (!window.CFB) throw new Error('reader not loaded');
+    return textToHtml(docToText(buf));
+  }
+  const txt = new TextDecoder().decode(buf);
+  if (txt.trimStart().startsWith('{\\rtf')) return textToHtml(rtfToText(txt));
+  if (/<html|<body|<p[ >]/i.test(txt.slice(0, 4000))) return txt;   // Word "web page" saves
+  throw new Error('unsupported');
+}
 async function importDocx(file) {
-  if (!/\.docx$/i.test(file.name)) { toast('That file needs to be a .docx Word document.'); return; }
   if (!window.mammoth) { toast('The Word reader didn’t load. Check your connection and reload.'); return; }
   try {
-    const { value: html } = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
+    const html = await wordToHtml(file);
     let r = parseHtml(html, 'auto');
     if (!r.qCount) r = parseHtml(html, 'para');
     if (!r.items.length) { toast('No text found in that document.'); return; }
-    const b = newBoard(file.name.replace(/\.docx$/i, ''));
+    const b = newBoard(file.name.replace(/\.(docx|docm|dotx|dotm|doc|dot|rtf|html?)$/i, ''));
     let y = 70; const gap = meta.settings.gap;
     for (const [i, raw] of r.items.entries()) {
       const imgs = (await Promise.all(raw.imgs.map(im => imgSize(im.src)))).filter(Boolean);
@@ -576,7 +648,7 @@ async function importDocx(file) {
     }
     openBoard(b);
     persist(b);
-  } catch (err) { console.error(err); toast('Couldn’t read that document. Try saving it again as .docx.'); }
+  } catch (err) { console.error(err); toast('Couldn’t read that file. It needs to be a Word document (.docx, .doc, .rtf).'); }
 }
 
 /* ---------- tabs / navigation ---------- */
@@ -661,7 +733,7 @@ function renderHome() {
     <button class="home-gear" title="Default background and spacing" aria-label="Settings">${svg('sliders')}</button>
     <div class="home-in">
       <div class="start">
-        <button class="drop" id="drop">${svg('upload')}<b>Open a Word document</b><span>Drop a .docx here. Each question gets its own writing space.</span></button>
+        <button class="drop" id="drop">${svg('upload')}<b>Open a Word document</b><span>Drop a Word file here. Each question gets its own writing space.</span></button>
         <button class="blank" id="blank"><b>Blank board</b><span>Start writing</span></button>
       </div>
       <div class="saved"><h2>Saved</h2><div id="rows"></div></div>
