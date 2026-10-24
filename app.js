@@ -14,6 +14,9 @@ const PRESETS = [
 const PALETTE = [null, '#e5484d', '#2f6bff', '#2fa56b', '#f08c00', '#8e4ec6'];
 const PEN_W = [2.5, 4.5, 8];
 const ERASE_R = [10, 20, 34];
+const SMOOTH_R = [0, 9, 20, 38];       // lazy-brush string length (px): the pen follows the cursor at a distance
+const SMOOTH_PASS = [0, 3, 7, 12];     // relaxation passes applied to the finished stroke
+const SMOOTH_NAME = ['Off', 'Low', 'High', 'Max'];
 const ICON = {
   text: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
   laser: '<circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',
@@ -51,7 +54,7 @@ const toast = (() => {
 })();
 
 /* ---------- storage ---------- */
-const DEFAULTS = { bg: '#ffffff', grid: false, ink: null, gap: 460, size: 30 };
+const DEFAULTS = { bg: '#ffffff', grid: false, ink: null, gap: 460, size: 30, smooth: 2 };
 let meta = { settings: { ...DEFAULTS }, open: [], active: null };
 try { Object.assign(meta, JSON.parse(localStorage.getItem('wb.meta') || '{}')); meta.settings = { ...DEFAULTS, ...meta.settings }; } catch (e) {}
 const saveMeta = () => { try { localStorage.setItem('wb.meta', JSON.stringify(meta)); } catch (e) {} };
@@ -340,6 +343,8 @@ cv.addEventListener('pointerdown', e => {
   if (t === 'eraser') { erasing = { list: [] }; eraseAt(w.x, w.y); requestDraw(); return; }
   const wd = t === 'hl' ? PEN_W[tool.size] * 4.5 : PEN_W[tool.size];
   live = { id: uid(), t: t === 'hl' ? 'hl' : t, c: tool.color, w: wd, pts: (t === 'pen' || t === 'hl') ? [w.x, w.y] : [w.x, w.y, w.x, w.y] };
+  live.bx = live.tx = w.x; live.by = live.ty = w.y; live.ax = w.cx; live.ay = w.cy;
+  armDwell();
   requestDraw();
 });
 cv.addEventListener('pointermove', e => {
@@ -351,7 +356,16 @@ cv.addEventListener('pointermove', e => {
   const w = toWorld(e);
   if (live) {
     const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
-    if (live.t === 'pen' || live.t === 'hl') for (const ev of (evs.length ? evs : [e])) { const q = toWorld(ev); live.pts.push(q.x, q.y); }
+    if (Math.hypot(e.clientX - live.ax, e.clientY - live.ay) > 3) { live.ax = e.clientX; live.ay = e.clientY; armDwell(); }
+    if (live.t === 'pen' || live.t === 'hl') {
+      const R = SMOOTH_R[meta.settings.smooth];
+      for (const ev of (evs.length ? evs : [e])) {
+        const q = toWorld(ev); live.tx = q.x; live.ty = q.y;
+        if (!R) { live.pts.push(q.x, q.y); continue; }
+        const d = Math.hypot(q.x - live.bx, q.y - live.by);
+        if (d > R) { const k = (d - R) / d; live.bx += (q.x - live.bx) * k; live.by += (q.y - live.by) * k; live.pts.push(live.bx, live.by); }
+      }
+    }
     else {
       let { x, y } = w;
       if (live.t === 'line' && e.shiftKey) {
@@ -379,14 +393,99 @@ const endPointer = e => {
   if (live) {
     const s = live;
     live = null;
+    clearTimeout(dwellTimer);
+    if ((s.t === 'pen' || s.t === 'hl') && s.pts.length > 2) finishInk(s);
     s.bb = bboxOf(s);
-    if (s.pts.length > 4 && (s.t === 'pen' || s.t === 'hl')) simplify(s);
     commit(cur, [{ k: 'add', s }]);
     if (s.pts.length <= 4 && s.bb[2] - s.bb[0] < 14) { recentDots.push({ s, ops: cur.undo[cur.undo.length - 1], t: performance.now() }); if (recentDots.length > 4) recentDots.shift(); }
   }
   if (erasing) { const l = erasing.list; erasing = null; if (l.length) { l.forEach(s => cur.strokes.push(s)); commit(cur, [{ k: 'del', list: l }]); } }
   requestDraw();
 };
+/* ---------- handwriting correction ---------- */
+let dwellTimer = 0;
+const armDwell = () => { clearTimeout(dwellTimer); dwellTimer = setTimeout(snapShape, 480); };
+function pathLen(p) { let l = 0; for (let i = 2; i < p.length; i += 2) l += Math.hypot(p[i] - p[i - 2], p[i + 1] - p[i - 1]); return l; }
+function resample(p, step) {
+  const out = [p[0], p[1]]; let carry = 0;
+  for (let i = 2; i < p.length; i += 2) {
+    let x0 = p[i - 2], y0 = p[i - 1]; const x1 = p[i], y1 = p[i + 1];
+    let seg = Math.hypot(x1 - x0, y1 - y0);
+    while (carry + seg >= step) {
+      const t = (step - carry) / seg; x0 += (x1 - x0) * t; y0 += (y1 - y0) * t; out.push(x0, y0);
+      seg = Math.hypot(x1 - x0, y1 - y0); carry = 0;
+    }
+    carry += seg;
+  }
+  const n = out.length;
+  if (Math.hypot(out[n - 2] - p[p.length - 2], out[n - 1] - p[p.length - 1]) > 0.5) out.push(p[p.length - 2], p[p.length - 1]);
+  return out;
+}
+function relax(p, passes) {          // pull each point toward its neighbours; ends stay put
+  let a = p;
+  for (let k = 0; k < passes; k++) {
+    const b = a.slice();
+    for (let i = 2; i < a.length - 2; i += 2) { b[i] = (a[i - 2] + 2 * a[i] + a[i + 2]) / 4; b[i + 1] = (a[i - 1] + 2 * a[i + 1] + a[i + 3]) / 4; }
+    a = b;
+  }
+  return a;
+}
+function finishInk(s) {
+  const lvl = meta.settings.smooth;
+  if (lvl && !s.snapped) {
+    const L = live_catchUp(s);
+    void L;
+    if (pathLen(s.pts) > 12) s.pts = relax(resample(s.pts, 3), SMOOTH_PASS[lvl]);
+  }
+  simplify(s);
+}
+function live_catchUp(s) {           // the lazy brush trails the cursor: glide the last stretch in so the stroke ends where you let go
+  const n = s.pts.length, bx = s.pts[n - 2], by = s.pts[n - 1];
+  if (s.tx === undefined) return 0;
+  for (let i = 1; i <= 4; i++) s.pts.push(bx + (s.tx - bx) * i / 4, by + (s.ty - by) * i / 4);
+  return 1;
+}
+/* Hold still at the end of a stroke and a wobbly line, circle or box snaps to a clean one. */
+function snapShape() {
+  if (!live || (live.t !== 'pen' && live.t !== 'hl') || live.pts.length < 8) return;
+  const r = recognize(live.pts); if (!r) return;
+  live.t = r.t; live.pts = r.pts; live.snapped = true; requestDraw();
+}
+function recognize(p) {
+  const n = p.length / 2, L = pathLen(p); if (L < 30) return null;
+  const x0 = p[0], y0 = p[1], x1 = p[p.length - 2], y1 = p[p.length - 1], C = Math.hypot(x1 - x0, y1 - y0);
+  let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+  for (let i = 0; i < p.length; i += 2) { bx0 = Math.min(bx0, p[i]); bx1 = Math.max(bx1, p[i]); by0 = Math.min(by0, p[i + 1]); by1 = Math.max(by1, p[i + 1]); }
+  const w = bx1 - bx0, h = by1 - by0;
+  if (C / L > 0.86) {                       // straight
+    let dev = 0;
+    for (let i = 0; i < p.length; i += 2) dev = Math.max(dev, Math.abs((x1 - x0) * (y0 - p[i + 1]) - (x0 - p[i]) * (y1 - y0)) / (C || 1));
+    if (dev < 0.1 * C + 4) {
+      let ex = x1, ey = y1; const a = Math.atan2(y1 - y0, x1 - x0), deg = a * 180 / Math.PI;
+      const near = (t) => Math.abs(((deg - t + 540) % 360) - 180) < 6;
+      if (near(0) || near(180)) ey = y0; else if (near(90) || near(-90)) ex = x0;
+      return { t: 'line', pts: [x0, y0, ex, ey] };
+    }
+    return null;
+  }
+  if (C / L < 0.3 && w > 24 && h > 24) {    // closed: box or oval
+    const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2;
+    let eE = 0, eR = 0;
+    for (let i = 0; i < p.length; i += 2) {
+      const nx = (p[i] - cx) / (w / 2), ny = (p[i + 1] - cy) / (h / 2);
+      eE += Math.abs(Math.hypot(nx, ny) - 1);
+      const ed = Math.min(p[i] - bx0, bx1 - p[i], p[i + 1] - by0, by1 - p[i + 1]) / Math.min(w, h);
+      eR += ed;
+    }
+    eE /= n; eR /= n;
+    if (eR < 0.075 && eR < eE) return { t: 'rect', pts: [bx0, by0, bx1, by1] };
+    if (eE < 0.16) {
+      if (Math.abs(w - h) < 0.14 * Math.max(w, h)) { const d = (w + h) / 2; return { t: 'ellipse', pts: [cx - d / 2, cy - d / 2, cx + d / 2, cy + d / 2] }; }
+      return { t: 'ellipse', pts: [bx0, by0, bx1, by1] };
+    }
+  }
+  return null;
+}
 function simplify(s) { // drop near-duplicate points to keep saves small
   const p = s.pts, out = [p[0], p[1]];
   for (let i = 2; i < p.length - 2; i += 2) if (Math.hypot(p[i] - out[out.length - 2], p[i + 1] - out[out.length - 1]) >= 0.8) out.push(p[i], p[i + 1]);
@@ -872,6 +971,9 @@ function buildToolbar() {
   g.append(cu);
   g = grp();
   [6, 10, 15].forEach((d, i) => { const b = document.createElement('button'); b.className = 'tb sz'; b.dataset.s = i; b.title = ['Thin', 'Medium', 'Thick'][i]; b.setAttribute('aria-label', b.title); b.innerHTML = `<i style="width:${d}px;height:${d}px"></i>`; b.onclick = () => { tool.size = i; updateToolbarState(); }; g.append(b); });
+  const sm = document.createElement('button'); sm.className = 'tb wide txt'; sm.id = 'bSmooth';
+  sm.onclick = () => { meta.settings.smooth = (meta.settings.smooth + 1) % 4; saveMeta(); updateToolbarState(); };
+  g.append(sm);
   g = grp();
   btn(g, 'undo', 'Undo (Ctrl+Z)', undo).id = 'bUndo';
   btn(g, 'redo', 'Redo (Ctrl+Y)', redo).id = 'bRedo';
@@ -880,6 +982,10 @@ function buildToolbar() {
 }
 function updateToolbarState() {
   const tb = $('#toolbar');
+  const sm = $('#bSmooth'), lv = meta.settings.smooth;
+  sm.innerHTML = 'Smooth<br>' + SMOOTH_NAME[lv];
+  sm.title = 'Handwriting smoothing: ' + SMOOTH_NAME[lv] + ' (click to change). Hold still at the end of a stroke to snap lines, circles and boxes.';
+  sm.setAttribute('aria-pressed', String(lv > 0));
   tb.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.tool === tool.name)));
   tb.querySelectorAll('.sz').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.s === tool.size)));
   const ink = cur ? inkOf(cur) : '#000';
