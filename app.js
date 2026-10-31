@@ -37,6 +37,7 @@ const ICON = {
   trash: '<path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/>',
   doc: '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/>',
   upload: '<path d="M12 16V5M7.5 9.5L12 5l4.5 4.5"/><path d="M5 19h14"/>',
+  resize: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M4 11h16M10 5v14"/>',
 };
 const svg = (n, extra = '') => `<svg class="i" viewBox="0 0 24 24" ${extra} aria-hidden="true">${ICON[n]}</svg>`;
 
@@ -79,8 +80,8 @@ let cur = null;
 const timers = new Map();
 function plain(b) {
   return {
-    id: b.id, name: b.name, created: b.created, updated: b.updated, bg: b.bg, grid: b.grid, ink: b.ink, size: b.size, wrapW: b.wrapW, scroll: b.scroll,
-    items: b.items.map(i => ({ id: i.id, y: i.y, lines: i.lines, imgs: i.imgs })),
+    id: b.id, name: b.name, created: b.created, updated: b.updated, bg: b.bg, grid: b.grid, ink: b.ink, size: b.size, wrapW: b.wrapW, tscale: b.tscale, scroll: b.scroll,
+    items: b.items.map(i => ({ id: i.id, y: i.y, lines: i.lines, imgs: i.imgs, tables: i.tables || [] })),
     strokes: b.strokes,
   };
 }
@@ -96,7 +97,7 @@ addEventListener('pagehide', flush);
 function newBoard(name) {
   const s = meta.settings;
   const b = {
-    id: uid(), name, created: Date.now(), updated: Date.now(), bg: s.bg, grid: s.grid, ink: s.ink, size: s.size,
+    id: uid(), name, created: Date.now(), updated: Date.now(), bg: s.bg, grid: s.grid, ink: s.ink, size: s.size, tscale: 1,
     wrapW: Math.max(420, Math.min(1180, innerWidth - X0 - 150)), scroll: 0, items: [], strokes: [], undo: [], redo: [],
   };
   boards.set(b.id, b);
@@ -111,6 +112,7 @@ let mouse = { x: 0, y: 0, in: false };
 let live = null;        // stroke being drawn
 let erasing = null;     // { list } while erasing
 let drag = null;        // question being dragged
+let tdrag = null;       // table border being dragged (resize tool)
 let panning = null;
 let hoverItem = null;
 let editing = null;
@@ -144,8 +146,50 @@ function getImg(src) {
   if (!i) { i = new Image(); i.onload = requestDraw; i.src = src; imgCache.set(src, i); }
   return i;
 }
+/* Tables: t = { nr, nc, hdr, cells: [{ r, c, cs, rs, t }], cols: [width fractions], f: width as a fraction of the page, rmin: [row heights] } */
+const tableFont = b => Math.max(11, Math.round(b.size * 0.74 * (b.tscale || 1)));
+function tableLayout(b, t) {
+  const fs = tableFont(b), lh = Math.round(fs * 1.4), pad = Math.round(fs * 0.55);
+  const w = Math.round(Math.max(60, Math.min(1, t.f) * b.wrapW));
+  const xs = [0]; t.cols.forEach(f => xs.push(xs[xs.length - 1] + f * w));
+  const rh = Array.from({ length: t.nr }, (_, r) => (t.rmin && t.rmin[r]) || (t.hdr && r === 0 ? lh + pad * 2 : Math.round(lh * 2.3)));
+  const laid = t.cells.map(c => {
+    const hd = !!t.hdr && c.r === 0, cw = xs[c.c + c.cs] - xs[c.c];
+    ctx.font = `${hd ? '600 ' : ''}${fs}px ${FONT}`;
+    const rows = c.t ? c.t.split('\n').flatMap(p => wrapText(p, cw - pad * 2)) : [];
+    return { c, hd, cw, rows, need: rows.length * lh + pad * 2 };
+  });
+  for (const L of laid) if (L.c.rs === 1) rh[L.c.r] = Math.max(rh[L.c.r], L.need);
+  for (const L of laid) if (L.c.rs > 1) {
+    const last = L.c.r + L.c.rs - 1, have = rh.slice(L.c.r, last + 1).reduce((a, v) => a + v, 0);
+    if (L.need > have) rh[last] += L.need - have;
+  }
+  const ys = [0]; rh.forEach(v => ys.push(ys[ys.length - 1] + v));
+  const cells = laid.map(L => ({
+    x: xs[L.c.c], y: ys[L.c.r], w: L.cw, h: ys[L.c.r + L.c.rs] - ys[L.c.r], rows: L.rows, hd: L.hd,
+    mid: L.hd || (L.c.t.length <= 16 && !L.c.t.includes('\n')),
+  }));
+  return { t, w, h: ys[t.nr], xs, ys, cells, fs, lh, pad };
+}
+/* First-time column widths: the Word file's own grid when we have it, otherwise sized to the content */
+function tableDefaults(b, t) {
+  const grid = t.grid; delete t.grid;
+  if (grid && grid.length === t.nc && grid.every(g => g > 0)) {
+    const tot = grid.reduce((a, g) => a + g, 0);
+    t.cols = grid.map(g => g / tot);
+    t.f = Math.max(0.4, Math.min(1, (tot / 15) * (b.size / 16) / b.wrapW));   // twips -> px, scaled to the board's text size
+    return;
+  }
+  const fs = tableFont(b), pad = Math.round(fs * 0.55), wt = Array(t.nc).fill(70);
+  ctx.font = `600 ${fs}px ${FONT}`;
+  for (const c of t.cells) if (c.cs === 1) wt[c.c] = Math.max(wt[c.c], Math.min(b.wrapW * 0.5, Math.max(0, ...c.t.split('\n').map(p => ctx.measureText(p).width)) + pad * 2));
+  const tot = wt.reduce((a, g) => a + g, 0);
+  t.cols = wt.map(g => g / tot); t.f = Math.max(0.4, Math.min(1, tot / b.wrapW));
+}
 function metrics(b, it) {
-  const key = b.size + '|' + b.wrapW + '|' + it.lines.map(l => l.ind + ':' + l.t).join('\n') + '|' + it.imgs.length;
+  const tbs = it.tables || [];
+  const key = b.size + '|' + b.wrapW + '|' + (b.tscale || 1) + '|' + it.lines.map(l => l.ind + ':' + l.t).join('\n') + '|' + it.imgs.length
+    + '|' + tbs.map(t => t.f + ',' + t.cols.join(',') + ',' + (t.rmin ? t.rmin.join(',') : '')).join(';');
   if (it._k === key) return it._m;
   const size = b.size, lh = Math.round(size * 1.42);
   ctx.font = `${size}px ${FONT}`;
@@ -155,13 +199,15 @@ function metrics(b, it) {
     wrapText(ln.t, b.wrapW - x).forEach(t => rows.push({ t, x }));
   }
   let h = rows.length * lh;
+  const tbls = [];
+  for (const t of tbs) { const L = tableLayout(b, t); h += 12; L.y = h; h += L.h; tbls.push(L); }
   const ims = [];
   for (const im of it.imgs) {
     const sc = Math.min(1, Math.min(b.wrapW, 720) / im.w, 380 / im.h);
     const w = im.w * sc, hh = im.h * sc;
     h += 12; ims.push({ src: im.src, y: h, w, h: hh }); h += hh;
   }
-  it._k = key; it._m = { rows, lh, h: Math.max(h, lh), ims };
+  it._k = key; it._m = { rows, lh, h: Math.max(h, lh), ims, tbls };
   return it._m;
 }
 const sortedItems = b => b.items.slice().sort((a, c) => a.y - c.y);
@@ -213,6 +259,27 @@ function drawGrid(b, st) {
   }
   void ink;
 }
+function drawTable(it, tb, ink) {
+  const x = X0, y = it.y + tb.y;
+  ctx.fillStyle = ink; ctx.globalAlpha = 0.07;
+  for (const c of tb.cells) if (c.hd) ctx.fillRect(x + c.x, y + c.y, c.w, c.h);
+  ctx.globalAlpha = 0.8; ctx.strokeStyle = ink; ctx.lineWidth = 1.5; ctx.beginPath();
+  for (const c of tb.cells) ctx.rect(x + c.x, y + c.y, c.w, c.h);
+  ctx.stroke(); ctx.globalAlpha = 1; ctx.fillStyle = ink;
+  for (const c of tb.cells) {
+    ctx.font = `${c.hd ? '600 ' : ''}${tb.fs}px ${FONT}`;
+    ctx.textAlign = c.mid ? 'center' : 'left';
+    const tx = x + c.x + (c.mid ? c.w / 2 : tb.pad), top = y + c.y + (c.h - c.rows.length * tb.lh) / 2;
+    c.rows.forEach((r, i) => ctx.fillText(r, tx, top + i * tb.lh + tb.lh / 2));
+  }
+  ctx.textAlign = 'left';
+  if (tool.name !== 'resize') return;
+  ctx.strokeStyle = ctx.fillStyle = '#2f6bff'; ctx.lineWidth = 2; ctx.globalAlpha = 0.55; ctx.setLineDash([6, 5]);
+  ctx.strokeRect(x, y, tb.w, tb.h); ctx.setLineDash([]); ctx.globalAlpha = 0.95;
+  for (let i = 1; i < tb.xs.length; i++) ctx.fillRect(x + tb.xs[i] - 4, y - 16, 8, 16);
+  for (let j = 1; j < tb.ys.length; j++) ctx.fillRect(x - 16, y + tb.ys[j] - 4, 16, 8);
+  ctx.globalAlpha = 1; ctx.fillStyle = ink;
+}
 function draw() {
   raf = 0;
   if (!cur) return;
@@ -230,6 +297,7 @@ function draw() {
       ctx.font = `${b.size}px ${FONT}`; ctx.fillStyle = ink;
       m.rows.forEach((r, i) => ctx.fillText(r.t, X0 + r.x, it.y + i * m.lh + m.lh / 2));
     }
+    for (const tb of m.tbls) drawTable(it, tb, ink);
     for (const im of m.ims) { const img = getImg(im.src); if (img.complete && img.naturalWidth) ctx.drawImage(img, X0, it.y + im.y, im.w, im.h); }
     if (it === hoverItem || (drag && drag.it === it)) {
       ctx.fillStyle = inkOf(b); ctx.globalAlpha = drag && drag.it === it ? 0.6 : 0.3;
@@ -277,6 +345,7 @@ function applyOp(b, op, dir) {
     case 'del': dir > 0 ? op.list.forEach(s => rm(b.strokes, s)) : b.strokes.push(...op.list); break;
     case 'shift': shiftAll(op.refs, dir * op.d); break;
     case 'edit': setLines(op.it, dir > 0 ? op.after : op.before); break;
+    case 'tbl': { const v = dir > 0 ? op.after : op.before; op.t.f = v.f; op.t.cols = v.cols.slice(); op.t.rmin = v.rmin ? v.rmin.slice() : null; op.it._k = null; break; }
     case 'addItem': dir > 0 ? b.items.push(op.it) : rm(b.items, op.it); break;
     case 'delItem': dir > 0 ? rm(b.items, op.it) : b.items.push(op.it); break;
   }
@@ -338,6 +407,7 @@ cv.addEventListener('pointerdown', e => {
     if (it) { startDrag(it, w); return; }
   }
   const t = tool.name;
+  if (t === 'resize') { const h = tableHitAt(w); if (h) startTblDrag(h, w); return; }
   if (t === 'text') { textPending = w; return; }
   if (t === 'laser') { mouse = { x: w.x, y: e.clientY - cv.getBoundingClientRect().top, in: true }; requestDraw(); return; }
   if (t === 'eraser') { erasing = { list: [] }; eraseAt(w.x, w.y); requestDraw(); return; }
@@ -353,6 +423,7 @@ cv.addEventListener('pointermove', e => {
   mouse = { x: e.clientX - r.left, y: e.clientY - r.top, in: true };
   if (panning) { scroller.scrollTop = panning.st - (e.clientY - panning.cy); return; }
   if (drag) { drag.cy = e.clientY; return; }
+  if (tdrag) { tblDragMove(toWorld(e)); return; }
   const w = toWorld(e);
   if (live) {
     const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
@@ -382,13 +453,14 @@ cv.addEventListener('pointermove', e => {
     const hit = w.x < GRIP_W ? itemAt(w, true) : null;
     const hv = hit || (w.x < X0 + cur.wrapW + 30 ? itemAt(w) : null);
     if (hv !== hoverItem) { hoverItem = hv; }
-    cv.style.cursor = hit ? 'grab' : (tool.name === 'eraser' || tool.name === 'laser') ? 'none' : tool.name === 'text' ? 'text' : 'crosshair';
+    cv.style.cursor = hit ? 'grab' : tool.name === 'resize' ? resizeCursor(w) : toolCursor(tool.name);
   }
   requestDraw();
 });
 const endPointer = e => {
   if (panning) { panning = null; return; }
   if (drag) { endDrag(); return; }
+  if (tdrag) { endTblDrag(); return; }
   if (textPending) { const w = textPending; textPending = null; setTimeout(() => textAt(w), 0); return; }
   if (live) {
     const s = live;
@@ -402,6 +474,54 @@ const endPointer = e => {
   if (erasing) { const l = erasing.list; erasing = null; if (l.length) { l.forEach(s => cur.strokes.push(s)); commit(cur, [{ k: 'del', list: l }]); } }
   requestDraw();
 };
+/* ---------- table resizing (resize tool): drag a column or row border ---------- */
+const toolCursor = n => n === 'eraser' || n === 'laser' ? 'none' : n === 'text' ? 'text' : n === 'resize' ? 'default' : 'crosshair';
+function tableHitAt(w) {
+  const G = 8;
+  for (const it of cur.items) {
+    const m = metrics(cur, it);
+    for (const tb of m.tbls) {
+      const ty = it.y + tb.y, rx = w.x - X0, ry = w.y - ty;
+      if (ry < -G - 16 || ry > tb.h + G || rx < -G - 16 || rx > tb.w + G) continue;
+      for (let i = tb.xs.length - 1; i >= 1; i--) if (Math.abs(rx - tb.xs[i]) <= G && ry >= -G - 16 && ry <= tb.h + G) return { it, tb, kind: 'col', i };
+      for (let j = 1; j < tb.ys.length; j++) if (Math.abs(ry - tb.ys[j]) <= G && rx >= -G - 16 && rx <= tb.w + G) return { it, tb, kind: 'row', i: j };
+    }
+  }
+  return null;
+}
+const resizeCursor = w => { const h = tableHitAt(w); return h ? (h.kind === 'row' ? 'row-resize' : 'col-resize') : 'default'; };
+const tblSnap = t => ({ f: t.f, cols: t.cols.slice(), rmin: t.rmin ? t.rmin.slice() : null });
+function startTblDrag(h, w) {
+  tdrag = { it: h.it, t: h.tb.t, kind: h.kind, i: h.i, x0: w.x, y0: w.y, xs: h.tb.xs.slice(), ys: h.tb.ys.slice(), w: h.tb.w, oldH: metrics(cur, h.it).h, before: tblSnap(h.tb.t) };
+  cv.style.cursor = h.kind === 'row' ? 'row-resize' : 'col-resize';
+}
+function tblDragMove(w) {
+  const d = tdrag, t = d.t, n = t.cols.length, MIN = 48;
+  if (d.kind === 'col') {
+    const dx = w.x - d.x0;
+    if (d.i === n) t.f = Math.max(Math.min(1, MIN * n / cur.wrapW), Math.min(1, (d.w + dx) / cur.wrapW));
+    else {
+      const px = d.before.cols.map(f => f * d.w), a = px[d.i - 1], sum = a + px[d.i];
+      const na = Math.max(MIN, Math.min(sum - MIN, a + dx));
+      px[d.i - 1] = na; px[d.i] = sum - na; t.cols = px.map(p => p / d.w);
+    }
+  } else {
+    const r = d.i - 1, rm = d.before.rmin ? d.before.rmin.slice() : [];
+    rm[r] = Math.max(28, Math.round(d.ys[d.i] - d.ys[r] + (w.y - d.y0))); t.rmin = rm;
+  }
+  d.it._k = null; sync(); requestDraw();
+}
+function endTblDrag() {
+  const d = tdrag, b = cur; tdrag = null;
+  const after = tblSnap(d.t);
+  if (JSON.stringify(after) === JSON.stringify(d.before)) { requestDraw(); return; }
+  const dh = metrics(b, d.it).h - d.oldH;
+  Object.assign(d.t, d.before); d.it._k = null;      // restore so commit() applies the change through the op
+  const ops = [{ k: 'tbl', t: d.t, it: d.it, before: d.before, after }];
+  if (dh) ops.push({ k: 'shift', refs: below(b, d.it.y + d.oldH - 0.5).filter(o => o !== d.it), d: dh });
+  commit(b, ops);
+}
+
 /* ---------- handwriting correction ---------- */
 let dwellTimer = 0;
 const armDwell = () => { clearTimeout(dwellTimer); dwellTimer = setTimeout(snapShape, 480); };
@@ -566,7 +686,7 @@ function applyDrag(scrollEdges) {
 }
 function endDrag() {
   applyDrag(false);
-  const d = drag; drag = null; cv.style.cursor = 'crosshair';
+  const d = drag; drag = null; cv.style.cursor = toolCursor(tool.name);
   if (d.applied) { cur.undo.push([{ k: 'shift', refs: d.refs, d: d.applied }]); cur.redo.length = 0; changed(); }
   requestDraw();
 }
@@ -607,7 +727,8 @@ function closeEditor() {
   });
   ed.hidden = true; it._edit = false;
   const same = JSON.stringify(after) === JSON.stringify(before);
-  if (!after.length) {
+  const keeps = it.imgs.length || (it.tables && it.tables.length);
+  if (!after.length && !keeps) {
     if (fresh) { b.items.splice(b.items.indexOf(it), 1); changed(); return; }
     deleteItem(it, oldH); return;
   }
@@ -647,13 +768,53 @@ function addQuestion() {
 /* ---------- Word import ---------- */
 const QRE = /^\s*(?:(?:question|problem|exercise|prob|q)\s*\.?\s*#?\s*\d{1,3}\b[.):\-–]?|\d{1,3}[.)](?=\s|$)|\(\d{1,3}\)(?=\s))/i;
 const SUBRE = /^\s*(?:\(?[a-z]\)|\(?[ivx]{1,4}\)|[a-z]\.(?=\s)|[•\-–*]\s)/i;
-function parseHtml(html, mode) {
+const SUP = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', n: 'ⁿ', i: 'ⁱ' };
+const SUB = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎', a: 'ₐ', e: 'ₑ', o: 'ₒ', x: 'ₓ' };
+/* Text of an element with <sup>/<sub> turned into real super/subscript characters (₁₇Cl³⁵, H₂O, x²), nested lists/images/tables left out */
+function richText(el) {
+  let s = '';
+  (function walk(n, map) {
+    for (const c of n.childNodes) {
+      if (c.nodeType === 3) s += map ? [...c.nodeValue].map(ch => map[ch] || ch).join('') : c.nodeValue;
+      else if (c.nodeType === 1) {
+        const tg = c.tagName;
+        if (tg === 'UL' || tg === 'OL' || tg === 'IMG' || tg === 'TABLE') continue;
+        walk(c, tg === 'SUP' ? SUP : tg === 'SUB' ? SUB : map);
+      }
+    }
+  })(el, null);
+  return s.replace(/\s+/g, ' ').trim();
+}
+function readTable(tb, grid) {
+  const trs = [...tb.rows], occ = [], cells = []; let nc = 0;
+  const cellText = td => {
+    const ps = [...td.querySelectorAll('p, li')].filter(e => !e.querySelector('p, li')).map(richText).filter(Boolean);
+    return (ps.length ? ps : [richText(td)]).filter(Boolean).join('\n');
+  };
+  trs.forEach((tr, r) => {
+    let c = 0; occ[r] = occ[r] || [];
+    for (const td of tr.cells) {
+      while (occ[r][c]) c++;
+      const cs = Math.max(1, +td.getAttribute('colspan') || 1), rs = Math.max(1, Math.min(trs.length - r, +td.getAttribute('rowspan') || 1));
+      for (let i = 0; i < rs; i++) { occ[r + i] = occ[r + i] || []; for (let j = 0; j < cs; j++) occ[r + i][c + j] = true; }
+      cells.push({ r, c, cs, rs, t: cellText(td), th: td.tagName === 'TH' });
+      c += cs; nc = Math.max(nc, c);
+    }
+  });
+  if (!cells.length) return null;
+  const first = cells.filter(c => c.r === 0);
+  const hdr = first.some(c => c.th) || (trs.length > 1 && first.length > 1 && first.every(c => c.t));
+  return { nr: trs.length, nc, hdr, cells: cells.map(({ r, c, cs, rs, t }) => ({ r, c, cs, rs, t })), grid };
+}
+function parseHtml(html, mode, grids) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const items = []; let cur_ = null, qCount = 0, listN = 0;
-  const mk = (t, ind = 0, extra = {}) => { cur_ = { lines: t ? [{ t, ind }] : [], imgs: [], ...extra }; items.push(cur_); return cur_; };
-  const add = (t, ind) => { if (!t) return; if (!cur_) mk(t, ind); else cur_.lines.push({ t, ind }); };
-  const textOf = el => { const c = el.cloneNode(true); c.querySelectorAll('ul,ol,img,table').forEach(n => n.remove()); return c.textContent.replace(/\s+/g, ' ').trim(); };
-  const addImgs = el => { const im = [...el.querySelectorAll('img')].map(i => i.src); if (!im.length) return; if (!cur_) mk(''); cur_.imgs.push(...im.map(src => ({ src }))); };
+  const items = []; let cur_ = null, qCount = 0, listN = 0, tblIdx = 0;
+  const topTables = doc.body.querySelectorAll(':scope > table').length;
+  if (!grids || grids.length !== topTables) grids = null;     // only trust the file's column widths when tables line up one-to-one
+  const mk = (t, ind = 0, extra = {}) => { cur_ = { lines: t ? [{ t, ind }] : [], imgs: [], tables: [], ...extra }; items.push(cur_); return cur_; };
+  const add = (t, ind) => { if (!t) return; if (!cur_ || cur_.endsTable) mk(t, ind); else cur_.lines.push({ t, ind }); };
+  const textOf = richText;
+  const addImgs = el => { const im = [...el.querySelectorAll('img')].map(i => i.src); if (!im.length) return; if (!cur_ || cur_.endsTable) mk(''); cur_.imgs.push(...im.map(src => ({ src }))); };
   function nested(li, depth) {
     for (const sub of li.children) {
       if (sub.tagName !== 'OL' && sub.tagName !== 'UL') continue;
@@ -685,7 +846,8 @@ function parseHtml(html, mode) {
     const tag = el.tagName;
     if (tag === 'UL' || tag === 'OL') return list(el);
     if (tag === 'TABLE') {
-      el.querySelectorAll('tr').forEach(tr => add([...tr.children].map(c => c.textContent.trim()).join('   |   '), 0));
+      const t = readTable(el, grids ? grids[tblIdx] : null); tblIdx++;
+      if (t) { if (!cur_ || cur_.endsTable) mk(''); cur_.tables.push(t); cur_.endsTable = true; }   // text after a table starts a new block, so order is kept
       return;
     }
     if (tag === 'DIV' || tag === 'SECTION') { [...el.children].forEach(block); return; }
@@ -699,7 +861,7 @@ function parseHtml(html, mode) {
     addImgs(el);
   }
   [...doc.body.children].forEach(block);
-  return { items: items.filter(i => i.lines.length || i.imgs.length), qCount };
+  return { items: items.filter(i => i.lines.length || i.imgs.length || i.tables.length), qCount };
 }
 const imgSize = src => new Promise(res => { const i = new Image(); i.onload = () => res({ src, w: i.naturalWidth, h: i.naturalHeight }); i.onerror = () => res(null); i.src = src; });
 /* Legacy .doc (binary Word 97-2003): read the piece table out of the OLE container */
@@ -763,36 +925,51 @@ function rtfToText(src) {
 const esc = t => t.replace(/&/g, '&amp;').replace(/</g, '&lt;');
 const textToHtml = t => t.split(/\r|\n/).map(l => l.trim()).filter(Boolean).map(l => `<p>${esc(l)}</p>`).join('');
 /* Any Word-ish file in, HTML out. Detects the real format from the bytes, not the extension. */
+/* The .docx's own column widths (mammoth drops them): top-level tables only, in document order */
+async function docxGrids(buf) {
+  try {
+    if (!window.JSZip) return null;
+    const zip = await JSZip.loadAsync(buf), f = zip.file('word/document.xml'); if (!f) return null;
+    const NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+    const body = new DOMParser().parseFromString(await f.async('string'), 'application/xml').getElementsByTagNameNS(NS, 'body')[0];
+    return [...body.children].filter(e => e.localName === 'tbl').map(tbl => {
+      const g = [...tbl.children].find(c => c.localName === 'tblGrid');
+      return g ? [...g.children].map(c => +c.getAttributeNS(NS, 'w') || 0) : null;
+    });
+  } catch (e) { return null; }
+}
 async function wordToHtml(file) {
   const buf = await file.arrayBuffer(), h = new Uint8Array(buf, 0, 8);
-  if (h[0] === 0x50 && h[1] === 0x4B) return (await mammoth.convertToHtml({ arrayBuffer: buf })).value;
+  if (h[0] === 0x50 && h[1] === 0x4B) return { html: (await mammoth.convertToHtml({ arrayBuffer: buf })).value, grids: await docxGrids(buf) };
   if (h[0] === 0xD0 && h[1] === 0xCF) {
     if (!window.CFB) throw new Error('reader not loaded');
-    return textToHtml(docToText(buf));
+    return { html: textToHtml(docToText(buf)) };
   }
   const txt = new TextDecoder().decode(buf);
-  if (txt.trimStart().startsWith('{\\rtf')) return textToHtml(rtfToText(txt));
-  if (/<html|<body|<p[ >]/i.test(txt.slice(0, 4000))) return txt;   // Word "web page" saves
+  if (txt.trimStart().startsWith('{\\rtf')) return { html: textToHtml(rtfToText(txt)) };
+  if (/<html|<body|<p[ >]/i.test(txt.slice(0, 4000))) return { html: txt };   // Word "web page" saves
   throw new Error('unsupported');
 }
 async function importDocx(file) {
   if (!window.mammoth) { toast('The Word reader didn’t load. Check your connection and reload.'); return; }
   try {
-    const html = await wordToHtml(file);
-    let r = parseHtml(html, 'auto');
-    if (!r.qCount) r = parseHtml(html, 'para');
+    const { html, grids } = await wordToHtml(file);
+    let r = parseHtml(html, 'auto', grids);
+    if (!r.qCount) r = parseHtml(html, 'para', grids);
     if (!r.items.length) { toast('No text found in that document.'); return; }
     const b = newBoard(file.name.replace(/\.(docx|docm|dotx|dotm|doc|dot|rtf|html?)$/i, ''));
-    let y = 70; const gap = meta.settings.gap;
+    let y = 70, nTables = 0; const gap = meta.settings.gap;
     for (const [i, raw] of r.items.entries()) {
       const imgs = (await Promise.all(raw.imgs.map(im => imgSize(im.src)))).filter(Boolean);
-      const it = { id: uid(), y: 0, lines: raw.lines, imgs };
+      raw.tables.forEach(t => tableDefaults(b, t)); nTables += raw.tables.length;
+      const it = { id: uid(), y: 0, lines: raw.lines, imgs, tables: raw.tables };
       const pre = i === 0 && !QRE.test(raw.lines[0] ? raw.lines[0].t : '') && r.qCount > 0 && raw.typed !== false;
       it.y = y; b.items.push(it);
-      y += metrics(b, it).h + (pre ? 130 : gap);
+      y += metrics(b, it).h + (pre ? 130 : raw.endsTable ? 70 : gap);   // a table is its own answer space, so it needs less room below
     }
     openBoard(b);
     persist(b);
+    if (nTables) toast('Tables are drawn as charts. Press R (resize tool) to drag their borders; the sliders button sets text size and page width.');
   } catch (err) { console.error(err); toast('Couldn’t read that file. It needs to be a Word document (.docx, .doc, .rtf).'); }
 }
 
@@ -908,11 +1085,25 @@ function renderHome() {
 addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files[0]) { e.preventDefault(); importDocx(e.dataTransfer.files[0]); } });
 addEventListener('dragover', e => e.preventDefault());
 
+/* Change text size / page width / table size on an existing board: everything below a block that grew or shrank moves with it, handwriting included */
+function reflow(b, mutate) {
+  const items = sortedItems(b), old = items.map(it => ({ y: it.y, h: metrics(b, it).h }));
+  const strokes = b.strokes.map(s => s.pts[1]);
+  mutate();
+  const cuts = items.map((it, i) => ({ at: old[i].y + old[i].h - 0.5, d: metrics(b, it).h - old[i].h })).filter(c => c.d);
+  const shiftFor = y => cuts.reduce((a, c) => (y >= c.at ? a + c.d : a), 0);
+  const ds = items.map((_, i) => shiftFor(old[i].y)), sd = strokes.map(shiftFor);
+  items.forEach((it, i) => { it.y += ds[i]; });
+  b.strokes.forEach((s, i) => { if (sd[i]) shiftObj(s, sd[i]); });
+  sync(); persist(b); requestDraw();
+}
+
 /* ---------- settings ---------- */
 function openSettings(board) {
   const target = board || meta.settings;
   const modal = $('#modal'); modal.hidden = false;
   const dk = isDark(target.bg);
+  const maxWrap = Math.max(520, Math.floor((innerWidth - X0 - 40) / 20) * 20);
   const sub = board ? 'Applies to this board.' : 'Defaults for new boards.';
   modal.innerHTML = `<div class="card" role="dialog" aria-label="Settings"><h3>${board ? 'Board' : 'Defaults'}</h3><p class="sub">${sub}</p>
     <div class="lbl">Background</div><div class="presets"></div>
@@ -920,7 +1111,10 @@ function openSettings(board) {
     <div class="line"><span>Color</span><input type="color" id="cbg" value="${target.bg}"></div>
     <div class="line"><label class="chk"><input type="checkbox" id="cgrid" ${target.grid ? 'checked' : ''}>Graph paper</label></div>
     <div class="line"><span>Writing color</span><span><button class="mini" id="cauto">Auto</button><input type="color" id="cink" value="${target.ink || (dk ? '#f3f3f1' : '#16181d')}"></span></div>
-    ${board ? '' : `<div class="lbl">Questions</div>
+    ${board ? `<div class="lbl">Document size</div>
+    <div class="line"><span>Text size</span><input type="range" id="bsize" min="20" max="48" step="2" value="${board.size}"><span class="val" id="vbsize">${board.size}</span></div>
+    <div class="line"><span>Page width</span><input type="range" id="bwid" min="420" max="${maxWrap}" step="20" value="${Math.min(board.wrapW, maxWrap)}"><span class="val" id="vbwid">${Math.round(board.wrapW)}</span></div>
+    <div class="line"><span>Table text</span><input type="range" id="btab" min="60" max="140" step="5" value="${Math.round((board.tscale || 1) * 100)}"><span class="val" id="vbtab">${Math.round((board.tscale || 1) * 100)}%</span></div>` : `<div class="lbl">Questions</div>
     <div class="line"><span>Writing space</span><input type="range" id="cgap" min="160" max="1000" step="20" value="${meta.settings.gap}"><span class="val" id="vgap">${meta.settings.gap}</span></div>
     <div class="line"><span>Text size</span><input type="range" id="csize" min="20" max="48" step="2" value="${meta.settings.size}"><span class="val" id="vsize">${meta.settings.size}</span></div>`}
     <button class="done">Done</button></div>`;
@@ -939,6 +1133,12 @@ function openSettings(board) {
   $('#cgrid', modal).onchange = e => { target.grid = e.target.checked; mark(); apply(); };
   $('#cink', modal).oninput = e => { target.ink = e.target.value; apply(); };
   $('#cauto', modal).onclick = () => { target.ink = null; apply(); };
+  if (board) {
+    const bind = (id, vid, fmt, set) => { $(id, modal).oninput = e => { const v = +e.target.value; $(vid).textContent = fmt(v); reflow(board, () => set(v)); }; };
+    bind('#bsize', '#vbsize', v => v, v => { board.size = v; });
+    bind('#bwid', '#vbwid', v => v, v => { board.wrapW = v; });
+    bind('#btab', '#vbtab', v => v + '%', v => { board.tscale = v / 100; });
+  }
   if (!board) {
     $('#cgap', modal).oninput = e => { meta.settings.gap = +e.target.value; $('#vgap').textContent = e.target.value; saveMeta(); };
     $('#csize', modal).oninput = e => { meta.settings.size = +e.target.value; $('#vsize').textContent = e.target.value; saveMeta(); };
@@ -951,7 +1151,7 @@ function openSettings(board) {
 addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) $('#modal .done').click(); });
 
 /* ---------- toolbar ---------- */
-const TOOLS = [['laser', 'Pointer (L)'], ['text', 'Type (T) — or double-click / right-click anywhere'], ['pen', 'Pen (P)'], ['hl', 'Highlighter (H)'], ['eraser', 'Eraser (E)'], ['line', 'Line'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse']];
+const TOOLS = [['laser', 'Pointer (L)'], ['text', 'Type (T) — or double-click / right-click anywhere'], ['pen', 'Pen (P)'], ['hl', 'Highlighter (H)'], ['eraser', 'Eraser (E)'], ['line', 'Line'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse'], ['resize', 'Resize tables (R) — drag a column or row border']];
 function buildToolbar() {
   const tb = $('#toolbar'); tb.innerHTML = '';
   const grp = () => { const g = document.createElement('div'); g.className = 'grp'; tb.append(g); return g; };
@@ -959,7 +1159,7 @@ function buildToolbar() {
   let g = grp();
   btn(g, 'collapse', 'Hide toolbar (F)', () => setCollapsed(true), 'tb wide');
   g = grp();
-  TOOLS.forEach(([n, t]) => { const b = btn(g, n, t, () => { tool.name = n; updateToolbarState(); cv.style.cursor = n === 'eraser' || n === 'laser' ? 'none' : n === 'text' ? 'text' : 'crosshair'; }); b.dataset.tool = n; });
+  TOOLS.forEach(([n, t]) => { const b = btn(g, n, t, () => { tool.name = n; updateToolbarState(); cv.style.cursor = toolCursor(n); requestDraw(); }); b.dataset.tool = n; });
   g = grp();
   PALETTE.forEach((c, i) => {
     const b = document.createElement('button'); b.className = 'sw'; b.dataset.i = i; b.title = c ? 'Color' : 'Default ink'; b.setAttribute('aria-label', b.title);
@@ -978,7 +1178,7 @@ function buildToolbar() {
   btn(g, 'undo', 'Undo (Ctrl+Z)', undo).id = 'bUndo';
   btn(g, 'redo', 'Redo (Ctrl+Y)', redo).id = 'bRedo';
   btn(g, 'addq', 'Add a question', addQuestion);
-  btn(g, 'sliders', 'Background', () => cur && openSettings(cur));
+  btn(g, 'sliders', 'Board settings: background, text size, page width', () => cur && openSettings(cur));
 }
 function updateToolbarState() {
   const tb = $('#toolbar');
@@ -1000,6 +1200,7 @@ function updateToolbarState() {
 function setCollapsed(v) { document.body.classList.toggle('collapsed', v); setTimeout(sizeCanvas, 30); }
 $('#reveal').onclick = () => setCollapsed(false);
 
+const KEYTOOL = { p: 'pen', h: 'hl', e: 'eraser', l: 'laser', t: 'text', r: 'resize' };
 addEventListener('keydown', e => {
   if (!cur || editing || !$('#modal').hidden || e.target.isContentEditable || /INPUT|TEXTAREA/.test(e.target.tagName)) return;
   const k = e.key.toLowerCase(), mod = e.ctrlKey || e.metaKey;
@@ -1008,7 +1209,7 @@ addEventListener('keydown', e => {
   else if (mod) return;
   else if (k === 'f') setCollapsed(!document.body.classList.contains('collapsed'));
   else if (k === 'escape') setCollapsed(false);
-  else if ({ p: 'pen', h: 'hl', e: 'eraser', l: 'laser', t: 'text' }[k]) { tool.name = { p: 'pen', h: 'hl', e: 'eraser', l: 'laser', t: 'text' }[k]; updateToolbarState(); }
+  else if (KEYTOOL[k]) { tool.name = KEYTOOL[k]; cv.style.cursor = toolCursor(tool.name); updateToolbarState(); requestDraw(); }
 });
 
 /* ---------- boot ---------- */
@@ -1016,7 +1217,7 @@ addEventListener('keydown', e => {
   buildToolbar();
   const all = await idb('readonly', s => s.getAll());
   for (const raw of all || []) {
-    raw.items = (raw.items || []).map(i => ({ ...i, imgs: i.imgs || [] }));
+    raw.items = (raw.items || []).map(i => ({ ...i, imgs: i.imgs || [], tables: i.tables || [] }));
     boards.set(raw.id, { ...raw, undo: [], redo: [] });
   }
   meta.open = meta.open.filter(id => boards.has(id));
