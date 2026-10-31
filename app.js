@@ -1019,6 +1019,7 @@ function renderTabs() {
     t.onclick = e => { if (e.target.closest('.x') || nm.isContentEditable) return; if (!cur || cur.id !== id) { if (cur) { cur.scroll = scroller.scrollTop; flush(); } showBoard(b); } };
     t.onkeydown = e => { if (e.key === 'Enter' && !nm.isContentEditable) t.click(); };
     $('.x', t).onclick = () => closeTab(id);
+    t.oncontextmenu = e => { e.preventDefault(); tabMenu(e, b, nm); };
     nm.ondblclick = () => {
       nm.contentEditable = 'true'; nm.focus(); getSelection().selectAllChildren(nm);
       const done = () => { nm.contentEditable = 'false'; b.name = nm.textContent.trim() || b.name; nm.textContent = b.name; persist(b); };
@@ -1029,6 +1030,31 @@ function renderTabs() {
   const add = document.createElement('button'); add.className = 'tabs-btn'; add.title = 'New board'; add.innerHTML = svg('plus');
   add.onclick = e => { e.stopPropagation(); newMenu(add); };
   nav.append(add);
+}
+/* Right-click a tab: copy the board exactly as it is now (text, tables, handwriting, background, sizes) */
+function duplicateBoard(src) {
+  if (cur && cur.id === src.id) cur.scroll = scroller.scrollTop;
+  const names = new Set([...boards.values()].map(x => x.name));
+  let name = src.name + ' copy', n = 2; while (names.has(name)) name = `${src.name} copy ${n++}`;
+  const b = { ...structuredClone(plain(src)), id: uid(), name, created: Date.now(), updated: Date.now(), undo: [], redo: [] };
+  boards.set(b.id, b);
+  if (cur) flush();
+  meta.open.splice(meta.open.indexOf(src.id) + 1, 0, b.id);
+  showBoard(b); persist(b);
+}
+function tabMenu(e, b, nm) {
+  document.querySelectorAll('.pop').forEach(p => p.remove());
+  const p = document.createElement('div'); p.className = 'pop';
+  p.innerHTML = `<button data-a="dup">${svg('doc')}Duplicate</button><button data-a="ren">${svg('text')}Rename</button><button data-a="x">${svg('x')}Close tab</button>`;
+  document.body.append(p);
+  p.style.left = Math.min(e.clientX, innerWidth - 230) + 'px'; p.style.bottom = (innerHeight - e.clientY + 6) + 'px';
+  p.onclick = ev => {
+    const a = ev.target.closest('button'); if (!a) return; p.remove();
+    if (a.dataset.a === 'dup') duplicateBoard(b);
+    else if (a.dataset.a === 'x') closeTab(b.id);
+    else nm.ondblclick();
+  };
+  setTimeout(() => addEventListener('click', () => p.remove(), { once: true }), 0);
 }
 function newMenu(anchor) {
   document.querySelectorAll('.pop').forEach(p => p.remove());
